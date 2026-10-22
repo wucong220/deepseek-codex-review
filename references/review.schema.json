@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "task_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["PLAN", "ACCEPTANCE"]},
+    "verdict": {"type": "string", "enum": ["PASS", "REVISE", "BLOCKED"]},
+    "summary": {"type": "string"},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "requirement": {"type": "string"},
+          "result": {"type": "string", "enum": ["PASS", "FAIL", "UNVERIFIED"]},
+          "evidence": {"type": "string"}
+        },
+        "required": ["requirement", "result", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "required_changes": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["task_id", "phase", "verdict", "summary", "checks", "required_changes"],
+  "additionalProperties": false
+}
