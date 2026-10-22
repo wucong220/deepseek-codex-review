@@ -18,9 +18,11 @@ export async function validateTask(taskDir, cwd) {
   const workspace = await realpath(cwd);
   const task = await realpath(taskDir);
   const allowed = await realpath(join(workspace, 'work', 'codex-review'));
+  if (!inside(workspace, allowed)) throw new Error('Review root must stay inside this session workspace');
   if (!inside(allowed, task)) throw new Error('Task must be under this session workspace/work/codex-review');
   const state = JSON.parse(await readFile(join(task, 'state.json'), 'utf8'));
-  if (state.format !== 1 || await realpath(state.project) !== workspace || await realpath(state.task_dir) !== task) {
+  if (![1,2].includes(state.format) || !isAbsolute(state.project ?? '') || !isAbsolute(state.task_dir ?? '') ||
+      await realpath(state.project) !== workspace || await realpath(state.task_dir) !== task) {
     throw new Error('Task state does not belong to this session workspace');
   }
   return {workspace, task};
@@ -35,9 +37,9 @@ export async function apply(ctx, config = {}) {
   const {defineTool} = await import(pathToFileURL(join(config.dshRoot, 'node_modules/@deepseek-ai/dsh-tools/lib/index.js')).href);
   ctx.tools.register(defineTool({
     name: 'codex_review',
-    description: 'Run the user-authorized fixed Codex review helper for this workspace: plan, acceptance or status. Codex keeps its own read-only sandbox and default model/effort. No arbitrary shell commands. Initialize task materials using the deepseek-codex-review Skill first.',
+    description: 'Run the user-authorized fixed Codex review helper for this workspace: plan, acceptance, status or delivery verification. Codex keeps its own read-only sandbox and default model/effort. No arbitrary shell commands. Initialize task materials using the deepseek-codex-review Skill first.',
     parameters: {
-      action: {type:'string', required:true, enum:['plan','accept','status']},
+      action: {type:'string', required:true, enum:['plan','accept','status','verify']},
       task_dir: {type:'string', required:true, description:'Absolute existing task directory under this session workspace/work/codex-review'},
       images: {type:'array', items:{type:'string'}, description:'Optional absolute image paths inside this workspace'},
     },
@@ -47,7 +49,7 @@ export async function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       exec.signal.throwIfAborted();
-      if (!['plan','accept','status'].includes(args.action)) throw new Error('Unsupported action');
+      if (!['plan','accept','status','verify'].includes(args.action)) throw new Error('Unsupported action');
       const {workspace, task} = await validateTask(args.task_dir, exec.agent?.session.header.cwd);
       const script = await realpath(config.reviewScript);
       const hash = createHash('sha256').update(await readFile(script)).digest('hex');
@@ -56,7 +58,7 @@ export async function apply(ctx, config = {}) {
       for (const image of args.images ?? []) {
         const file = await realpath(image);
         if (!isAbsolute(image) || !inside(workspace, file)) throw new Error('Images must be inside this workspace');
-        if (args.action === 'status') throw new Error('status does not accept images');
+        if (['status','verify'].includes(args.action)) throw new Error('status and verify do not accept images');
         command.push('--image', file);
       }
       exec.signal.throwIfAborted();
