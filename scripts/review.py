@@ -113,6 +113,40 @@ def input_hashes(task, phase):
     return {name: digest(task / name) for name in names}
 
 
+def image_hashes(images):
+    return {image: digest(Path(image)) for image in images}
+
+
+def approved_plan_images(task, state):
+    current = input_hashes(task, "PLAN")
+    approval = state.get("approved_plan")
+    if isinstance(approval, dict) and set(approval) == {"input_hashes", "images"}:
+        if approval["input_hashes"] != current:
+            raise ValueError("缺少当前需求与方案的 PLAN/PASS；先执行 plan")
+        expected = approval["images"]
+        if not isinstance(expected, dict) or any(not isinstance(path, str) or not Path(path).is_absolute()
+                or not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for path, value in expected.items()):
+            raise ValueError("方案附图绑定记录无效；先重新 plan")
+    elif approval == current:
+        # Old approvals are usable only if the original PLAN had no unbound images.
+        last_plan = next((run for run in reversed(state["runs"]) if run["phase"] == "PLAN"), None)
+        if not last_plan or last_plan["status"] != "PASS" or last_plan["input_hashes"] != current:
+            raise ValueError("缺少当前需求与方案的 PLAN/PASS；先执行 plan")
+        if last_plan.get("images"):
+            raise ValueError("旧方案附图没有版本绑定；保留原会话并重新 plan")
+        expected = {}
+    else:
+        raise ValueError("缺少当前需求与方案的 PLAN/PASS；先执行 plan")
+    try:
+        actual = image_hashes(expected)
+    except OSError as exc:
+        raise ValueError(f"方案附图缺失或不可读；先重新 plan: {exc}") from exc
+    if actual != expected:
+        raise ValueError("方案附图版本已改变，原 PLAN/PASS 已失效；先重新 plan")
+    return list(expected)
+
+
 def git_output(project, *arguments, optional=False):
     if not shutil.which("git"):
         if optional:
@@ -365,7 +399,7 @@ PASS 必须无 FAIL、UNVERIFIED、漏项和待修改要求。能修复的问题
 证据不足不能猜测或给出通过。审查结论只覆盖本轮实际查看的产物版本。
 """
     if phase == "PLAN":
-        return common + "\n本轮只评审方案。核对方案、源材料、完整范围与验证方法是否足够，指出遗漏和风险。PLAN/PASS 仅允许开始执行，绝不表示成果已完成；未执行的验证不能写成已经通过。\n"
+        return common + "\n本轮只评审方案，artifact-snapshot.json 仅记录方案附图的内容哈希。核对方案、源材料、完整范围与验证方法是否足够，指出遗漏和风险。PLAN/PASS 仅允许开始执行，绝不表示成果已完成；未执行的验证不能写成已经通过。\n"
     return common + "\n本轮是完工验收。artifact-snapshot.json 记录了本轮实际文件版本；它只用于版本绑定，不能证明内容正确。必须直接读取真实产物，不能只信执行者总结。代码含已提交、暂存、未暂存和新增文件，依据正确起始版本与任务范围核对，不能漏掉已提交的修改。文档、表格、图像、证据任务需要真正做语义/视觉判断；文件存在、数量和结构验证通过不能代替质量。需要的材料、预览或工具不可用时标 UNVERIFIED，提出具体补充要求。全部要求有充分证据才 ACCEPTANCE/PASS。\n"
 
 
@@ -452,15 +486,13 @@ def review(args):
         artifact_paths(task / "artifacts.json", Path(state["project"]))
         for name in hashes:
             text_file(task / name)
+        plan_images = []
         if phase == "ACCEPTANCE":
-            approval = state.get("approved_plan")
-            current = input_hashes(task, "PLAN")
-            if not approval or approval != current:
-                raise ValueError("缺少当前需求与方案的 PLAN/PASS；先执行 plan")
+            plan_images = approved_plan_images(task, state)
             if not state.get("thread_id"):
                 raise ValueError("缺少原审查会话 ID，不能另建会话验收")
-        images = [str(Path(item).resolve(strict=True)) for item in args.image]
-        snapshot = artifact_snapshot(task, state, images) if phase == "ACCEPTANCE" else None
+        images = list(dict.fromkeys([*plan_images, *(str(Path(item).resolve(strict=True)) for item in args.image)]))
+        snapshot = artifact_snapshot(task, state, images) if phase == "ACCEPTANCE" else {"images": image_hashes(images)}
         fingerprint = json_digest({"input_hashes": hashes, "artifacts": snapshot})
         codex = shutil.which("codex.exe") if os.name == "nt" else shutil.which("codex")
         if not codex:
@@ -514,11 +546,12 @@ def review(args):
             validate_result(result, state["task_id"], phase, requirements, fingerprint)
             if input_hashes(task, phase) != hashes:
                 raise ValueError("审查期间材料已改变，本轮结论不能用于放行")
-            if snapshot is not None and artifact_snapshot(task, state, images) != snapshot:
-                raise ValueError("审查期间正式产物或 Git 版本已改变，本轮结论不能用于放行")
+            current_snapshot = artifact_snapshot(task, state, images) if phase == "ACCEPTANCE" else {"images": image_hashes(images)}
+            if current_snapshot != snapshot:
+                raise ValueError("审查期间附图、正式产物或 Git 版本已改变，本轮结论不能用于放行")
             record.update(status=result["verdict"], summary=result["summary"], result_sha256=digest(run_dir / "result.json"))
             if phase == "PLAN" and result["verdict"] == "PASS":
-                state["approved_plan"] = hashes
+                state["approved_plan"] = {"input_hashes": hashes, "images": snapshot["images"]}
             code = EXIT[result["verdict"]]
         except (Exception, KeyboardInterrupt) as exc:
             record.update(status="ERROR", error=f"{type(exc).__name__}: {exc}")
@@ -544,8 +577,9 @@ def acceptance_validity(task, state):
         return False, "最近一轮不是 ACCEPTANCE/PASS"
     try:
         hashes = input_hashes(task, "ACCEPTANCE")
-        if hashes != last["input_hashes"] or input_hashes(task, "PLAN") != state["approved_plan"]:
+        if hashes != last["input_hashes"]:
             return False, "需求、方案、清单或执行记录已改变"
+        approved_plan_images(task, state)
         snapshot = artifact_snapshot(task, state, last["images"])
         fingerprint = json_digest({"input_hashes": hashes, "artifacts": snapshot})
         if fingerprint != last["review_fingerprint"] or json_digest(snapshot) != last["artifact_fingerprint"]:

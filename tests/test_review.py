@@ -270,6 +270,81 @@ class RunnerTests(unittest.TestCase):
         preview.write_bytes(b"image fixture B")
         self.assertFalse(self.valid())
 
+    def plan_image(self):
+        # Outside the project so Git/declared artifacts cannot accidentally bind it.
+        image = Path(self.tmp.name) / "design.png"
+        image.write_bytes(b"design fixture A")
+        self.assertEqual(self.call("plan", images=[str(image)]), 0)
+        (self.task / "execution.md").write_text("真实产物记录", encoding="utf-8")
+        return image
+
+    def test_plan_image_changes_review_fingerprint(self):
+        image = self.plan_image()
+        first = r.read_json(self.task / "state.json")["runs"][-1]["review_fingerprint"]
+        image.write_bytes(b"design fixture B")
+        self.assertEqual(self.call("plan", images=[str(image)]), 0)
+        second = r.read_json(self.task / "state.json")["runs"][-1]["review_fingerprint"]
+        self.assertNotEqual(first, second)
+
+    def test_plan_image_change_before_acceptance_requires_new_plan(self):
+        image = self.plan_image()
+        image.write_bytes(b"design fixture B")
+        with self.assertRaisesRegex(ValueError, "图片|附图|PLAN/PASS"):
+            self.call("accept")
+
+    def test_plan_image_deletion_before_acceptance_requires_new_plan(self):
+        image = self.plan_image()
+        image.unlink()
+        with self.assertRaisesRegex(ValueError, "图片|附图|PLAN/PASS"):
+            self.call("accept")
+
+    def test_plan_image_change_during_plan_rejects_pass(self):
+        image = Path(self.tmp.name) / "design.png"
+        image.write_bytes(b"design fixture A")
+        def mutate(*args):
+            self.fake_success(*args)
+            image.write_bytes(b"design fixture B")
+        self.assertEqual(self.call("plan", mutate, images=[str(image)]), 12)
+        self.assertIsNone(r.read_json(self.task / "state.json")["approved_plan"])
+
+    def test_plan_image_is_reused_at_acceptance_without_new_image_argument(self):
+        image = self.plan_image()
+        self.assertEqual(self.call("accept"), 0)
+        self.assertIn(str(image.resolve()), self.commands[-1])
+        state = r.read_json(self.task / "state.json")
+        self.assertIn(str(image.resolve()), state["runs"][-1]["images"])
+        self.assertTrue(self.valid())
+
+    def test_plan_image_change_during_acceptance_rejects_pass(self):
+        image = self.plan_image()
+        def mutate(*args):
+            self.fake_success(*args)
+            image.write_bytes(b"design fixture B")
+        self.assertEqual(self.call("accept", mutate), 12)
+        self.assertFalse(self.valid())
+
+    def test_plan_image_change_after_acceptance_invalidates_verify(self):
+        image = self.plan_image()
+        self.assertEqual(self.call("accept"), 0)
+        self.assertTrue(self.valid())
+        image.write_bytes(b"design fixture B")
+        self.assertFalse(self.valid())
+
+    def test_legacy_plan_image_approval_requires_new_plan(self):
+        self.plan_image()
+        state = r.read_json(self.task / "state.json")
+        state["approved_plan"] = r.input_hashes(self.task, "PLAN")
+        r.save_json(self.task / "state.json", state)
+        with self.assertRaisesRegex(ValueError, "旧|附图|PLAN/PASS"):
+            self.call("accept")
+
+    def test_legacy_plan_without_images_remains_valid(self):
+        self.accepted()
+        state = r.read_json(self.task / "state.json")
+        state["approved_plan"] = r.input_hashes(self.task, "PLAN")
+        r.save_json(self.task / "state.json", state)
+        self.assertTrue(self.valid())
+
     def test_result_file_edits_invalidate_pass(self):
         self.accepted()
         state = r.read_json(self.task / "state.json")
