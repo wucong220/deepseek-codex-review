@@ -186,16 +186,21 @@ class RunnerTests(unittest.TestCase):
             self.call("review")
 
     def test_legacy_state_without_workflow_is_always_plan_required(self):
-        """旧任务没有 workflow 记录时一律判为 PLAN_REQUIRED，不做降级推断。
+        """旧任务没有 workflow 记录时一律按 PLAN_REQUIRED 解释，不做降级推断。
 
-        旧版 init 都要求方案文件，因此「没有类型记录」不能被解释成可以直接 review。
+        读路径（status）只在内存里解释、不写盘；写路径才持久化。
         """
         state = r.read_json(self.task / "state.json")
         del state["workflow"]
         state["runs"] = []
         state["approved_plan"] = None
         r.save_json(self.task / "state.json", state)
+        # 纯读取：不落盘
         self.assertEqual(r.task_workflow(r.read_json(self.task / "state.json")), "PLAN_REQUIRED")
+        self.assertNotIn("workflow", r.read_json(self.task / "state.json"))
+        # 显式持久化
+        state = r.read_json(self.task / "state.json")
+        self.assertEqual(r.task_workflow(state, persist=True), "PLAN_REQUIRED")
         refreshed = r.read_json(self.task / "state.json")
         self.assertEqual(refreshed["workflow"], "PLAN_REQUIRED")
         self.assertIn("workflow_migration_note", refreshed)
@@ -346,6 +351,84 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0]["status"], "PASS")
         self.assertIsNotNone(runs[0]["command"])
+
+    def test_consult_reads_previous_inside_the_lock(self):
+        """P1：续接时读取上一轮记录必须在锁内，否则并发续接会覆盖历史。
+
+        这里直接验证 _consult_locked 每次都重新读盘：先人为在锁内运行两轮，
+        确认 turns 累积而不是沿用调用方传入的旧快照。
+        """
+        question = Path(self.tmp.name) / "q.md"
+        question.write_text("问题", encoding="utf-8")
+        def ok(command, prompt, run_dir, timeout, on_thread):
+            on_thread(THREAD)
+            return "答复"
+        with patch.object(r, "invoke_consult", side_effect=ok), \
+             patch.object(r.shutil, "which", side_effect=lambda name: "codex-fixture" if name in {"codex", "codex.exe"} else WHICH(name)), \
+             redirect_stdout(io.StringIO()):
+            r.consult(argparse.Namespace(project=str(self.project), question_file=str(question), session=None, timeout=10))
+            cid = next((self.project / "work" / "codex-review-consult").iterdir()).name
+            r.consult(argparse.Namespace(project=str(self.project), question_file=str(question), session=cid, timeout=10))
+            r.consult(argparse.Namespace(project=str(self.project), question_file=str(question), session=cid, timeout=10))
+        record = r.read_json(self.project / "work" / "codex-review-consult" / cid / "consult.json")
+        self.assertEqual([t["turn"] for t in record["turns"]], [1, 2, 3])
+        turn_dirs = sorted(p.name for p in (self.project / "work" / "codex-review-consult" / cid).iterdir() if p.is_dir())
+        self.assertEqual(turn_dirs, ["001", "002", "003"])
+
+    def test_status_on_legacy_task_does_not_write_state(self):
+        """P1：无锁 status 解释旧任务类型时不得写盘，否则会覆盖并发审查写入的 runs。"""
+        state = r.read_json(self.task / "state.json")
+        del state["workflow"]
+        state["runs"] = []
+        r.save_json(self.task / "state.json", state)
+        before = (self.task / "state.json").read_bytes()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(r.status(argparse.Namespace(task=str(self.task), command="status")), 0)
+        after = (self.task / "state.json").read_bytes()
+        self.assertEqual(before, after, "status 不应写 state.json")
+        self.assertNotIn("workflow", r.read_json(self.task / "state.json"))
+
+    def test_locked_path_still_persists_legacy_migration(self):
+        """持锁的写路径仍要把迁移结果固定下来。"""
+        state = r.read_json(self.task / "state.json")
+        del state["workflow"]
+        state["runs"] = []
+        r.save_json(self.task / "state.json", state)
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "不允许 review"):
+            self.call("review")
+        refreshed = r.read_json(self.task / "state.json")
+        self.assertEqual(refreshed["workflow"], "PLAN_REQUIRED")
+        self.assertIn("workflow_migration_note", refreshed)
+
+    def test_preparing_retry_does_not_take_over_a_previous_phase_record(self):
+        """P2 反向断言：跨阶段调用不得改写别的阶段遗留的失败记录。"""
+        original = r.shutil.copyfile
+        state = {"fail": True}
+        def flaky(src, dst, *a, **kw):
+            if state["fail"] and Path(dst).name == "request.md":
+                raise OSError("模拟失败")
+            return original(src, dst, *a, **kw)
+        with patch.object(r, "shutil") and patch.object(r.shutil, "copyfile", side_effect=flaky):
+            self.assertEqual(self.call("plan"), 12)
+        runs = r.read_json(self.task / "state.json")["runs"]
+        self.assertEqual(len(runs), 1)
+        plan_record = dict(runs[0])
+        self.assertEqual(plan_record["phase"], "PLAN")
+        self.assertEqual(plan_record["status"], "ERROR")
+        # 换成 accept（不同阶段）：必须新建记录或报错，不得改写 PLAN 那条
+        state["fail"] = False
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        try:
+            self.call("accept")
+        except ValueError:
+            pass
+        after = r.read_json(self.task / "state.json")["runs"]
+        self.assertEqual(after[0]["phase"], plan_record["phase"])
+        self.assertEqual(after[0]["number"], plan_record["number"])
+        self.assertEqual(after[0]["status"], plan_record["status"])
+        self.assertIn("模拟失败", after[0].get("error", ""))
 
     def test_consult_records_advice_without_approval(self):
         """咨询只留轻量记录，不产生 PASS/REVISE，也不算验收通过。"""

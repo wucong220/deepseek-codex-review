@@ -527,26 +527,29 @@ WORKFLOW_COMMANDS = {
 WORKFLOW_FINAL_PHASE = {"PLAN_REQUIRED": "ACCEPTANCE", "DIRECT_REVIEW": "REVIEW"}
 
 
-def task_workflow(state):
+def task_workflow(state, persist=None):
     """返回任务的固定工作流类型。
 
     早于 workflow 字段的旧任务一律按 PLAN_REQUIRED 处理：旧版 init 都要求方案文件，
-    因此「没有类型记录」不能被解释成可以直接 review。若据此推断为 DIRECT_REVIEW，
-    一个方案被误删或恢复失败的旧任务就能绕过方案门禁拿到有效交付结论。
-    推断结果立即写回 state 固定，之后不再受 plan.md 增删影响。
+    因此「没有类型记录」不能被解释成可以直接 review。
+
+    persist: 只有明确持有任务锁的写路径才传 True 才会落盘迁移结果。只读路径
+    （status）必须在内存里解释，不得写 state.json——否则会覆盖并发审查刚写入的
+    runs，或与 save_json 的临时文件争用。
     """
     recorded = state.get("workflow")
     if recorded in WORKFLOWS:
         return recorded
     if recorded is not None:
         raise ValueError(f"任务的工作流类型无效: {recorded!r}；请核实 state.json")
-    task_dir = Path(state["task_dir"])
-    state["workflow"] = "PLAN_REQUIRED"
-    state["workflow_migrated_at"] = now()
-    state["workflow_migration_note"] = (
-        "旧任务没有 workflow 记录，按旧版要求方案文件的约定固定为 PLAN_REQUIRED；"
-        "如确为直接评审任务，请新建任务")
-    save_json(task_dir / "state.json", state)
+    if persist:
+        task_dir = Path(state["task_dir"])
+        state["workflow"] = "PLAN_REQUIRED"
+        state["workflow_migrated_at"] = now()
+        state["workflow_migration_note"] = (
+            "旧任务没有 workflow 记录，按旧版要求方案文件的约定固定为 PLAN_REQUIRED；"
+            "如确为直接评审任务，请新建任务")
+        save_json(task_dir / "state.json", state)
     return "PLAN_REQUIRED"
 
 
@@ -561,19 +564,17 @@ def consult(args):
         raise ValueError("project 必须是目录")
     if is_link(project / "work") or is_link(project / "work" / "codex-review-consult"):
         raise ValueError("咨询目录不能经过符号链接或目录联接")
-    previous = None
     consult_base = project / "work" / "codex-review-consult"
     if args.session:
-        # 只接受程序生成的咨询 ID，并确保最终路径仍在咨询目录内。
+        # 锁外只做格式与边界校验，读取记录必须留到持锁之后。
         session = str(args.session)
         if not CONSULT_ID.fullmatch(session):
             raise ValueError("session 必须是程序生成的咨询 ID（形如 C20261026T060000Z-ab12cd34）")
         root = (consult_base / session).resolve()
         if not root.is_relative_to(consult_base.resolve()) or root.parent != consult_base.resolve():
             raise ValueError("session 路径越出咨询目录，已拒绝")
-        previous = read_json(root / "consult.json")
-        if Path(previous["project"]) != project:
-            raise ValueError("该咨询记录不属于当前项目")
+    else:
+        root = None
     question = Path(args.question_file).resolve(strict=True)
     text_file(question)
     codex = shutil.which("codex.exe") if os.name == "nt" else shutil.which("codex")
@@ -581,24 +582,34 @@ def consult(args):
         raise ValueError("找不到 Codex 原生 CLI；请安装并登录，不会伪造咨询答复")
     consult_base.mkdir(parents=True, exist_ok=True)
     warning = exclude_review_records(project, extra="codex-review-consult")
-    if previous is None:
+    if root is None:
         # 秒级时间戳不足以唯一标识：同一秒内可能创建两条独立咨询。
         # 加随机后缀并用 exist_ok=False，绝不复用已有的咨询目录。
         while True:
-            consult_id = "C" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-            root = consult_base / consult_id
+            candidate = "C" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+            root = consult_base / candidate
             try:
                 root.mkdir(exist_ok=False)
+                consult_id = candidate
                 break
             except FileExistsError:
                 continue
-    consult_id = root.name
-    # 同一咨询的轮次编号与 consult.json 必须串行修改，否则并发续接会抢同一编号。
+        # 新建目录本身即独占，但统一走锁以保持同一条写入路径
+    else:
+        consult_id = root.name
+    # 同一咨询的轮次编号与 consult.json 必须串行修改。读取上一轮记录也必须在锁内，
+    # 否则两个并发续接都会拿到同一份旧 turns，后写入者会覆盖先完成那一轮的索引。
     with task_lock(root):
-        return _consult_locked(args, project, root, consult_id, previous, question, codex, warning)
+        return _consult_locked(args, project, root, consult_id, question, codex,
+                               warning, resume=bool(args.session))
 
 
-def _consult_locked(args, project, root, consult_id, previous, question, codex, warning):
+def _consult_locked(args, project, root, consult_id, question, codex, warning, resume):
+    previous = None
+    if resume:
+        previous = read_json(root / "consult.json")
+        if Path(previous["project"]) != project:
+            raise ValueError("该咨询记录不属于当前项目")
     turn = len([p for p in root.iterdir() if p.is_dir() and p.name[:3].isdigit()]) + 1
     turn_dir = root / f"{turn:03d}"
     turn_dir.mkdir(exist_ok=False)
@@ -745,7 +756,7 @@ def review(args):
             raise ValueError("旧任务请先用 upgrade 补充需求及产物清单，保留原会话后重新评审")
         # 由任务类型决定允许的命令，而不是由命令决定任务类型。
         # 这道检查必须先于任何 plan.md 判断，否则删/加 plan.md 就能改变可行路径。
-        workflow = task_workflow(state)
+        workflow = task_workflow(state, persist=True)
         allowed = WORKFLOW_COMMANDS[workflow]
         if args.command not in allowed:
             raise ValueError(
@@ -895,6 +906,8 @@ def acceptance_validity(task, state):
     if state["format"] != 2:
         return False, "旧版结论没有需求和产物绑定，请 upgrade 后重新评审"
     try:
+        # 不落盘：acceptance_validity 也会被无锁的 status 调用，
+        # 在这里写 state.json 会覆盖并发审查刚登记的新一轮。
         workflow = task_workflow(state)
     except (OSError, ValueError) as exc:
         return False, f"无法确定任务类型: {exc}"
