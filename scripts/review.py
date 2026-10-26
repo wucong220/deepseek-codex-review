@@ -212,12 +212,15 @@ def exclude_review_records(project, extra=None):
 def artifact_snapshot(task, state, images=()):
     project = Path(state["project"])
     runtime = project / "work" / "codex-review"
+    # 内部运行目录统一排除：审查记录与咨询记录都不属于正式产物，
+    # 否则新增一条咨询就可能让原本有效的 PASS 变成 STALE。
+    internal = (runtime, project / "work" / "codex-review-consult")
     files = {}
 
     def visit(path):
         # Do not resolve symlinks before checking: a link must not hide mutable content.
         path = Path(os.path.abspath(path))
-        if path.is_relative_to(runtime) or ".git" in path.parts:
+        if any(path.is_relative_to(root) for root in internal) or ".git" in path.parts:
             return
         key = str(path)
         if key in files:
@@ -513,6 +516,8 @@ PHASE_NEEDS_PLAN = {"ACCEPTANCE"}
 # 需要读取实际产物并绑定完整产物指纹的阶段
 ARTIFACT_PHASES = {"ACCEPTANCE", "REVIEW"}
 WORKFLOWS = {"PLAN_REQUIRED", "DIRECT_REVIEW"}
+# 咨询 ID 格式：C + UTC 时间戳 + 随机后缀，用于 --session 的边界校验
+CONSULT_ID = re.compile(r"C\d{8}T\d{6}Z-[0-9a-f]{8}")
 # 任务类型 -> 允许的命令。类型在 init 时固定，命令不能反过来改变类型。
 WORKFLOW_COMMANDS = {
     "PLAN_REQUIRED": ("plan", "accept"),
@@ -525,10 +530,9 @@ WORKFLOW_FINAL_PHASE = {"PLAN_REQUIRED": "ACCEPTANCE", "DIRECT_REVIEW": "REVIEW"
 def task_workflow(state):
     """返回任务的固定工作流类型。
 
-    旧任务（早于 workflow 字段）按历史推断：只要出现过 PLAN 轮次、留有方案批准记录，
-    或任务目录里存在 plan.md，就视为 PLAN_REQUIRED；其余视为 DIRECT_REVIEW。
-    把 plan.md 也算作信号，是因为「带方案初始化但尚未 plan」的旧任务否则会被判成
-    DIRECT_REVIEW，从而重新打开绕过方案门禁的路径。
+    早于 workflow 字段的旧任务一律按 PLAN_REQUIRED 处理：旧版 init 都要求方案文件，
+    因此「没有类型记录」不能被解释成可以直接 review。若据此推断为 DIRECT_REVIEW，
+    一个方案被误删或恢复失败的旧任务就能绕过方案门禁拿到有效交付结论。
     推断结果立即写回 state 固定，之后不再受 plan.md 增删影响。
     """
     recorded = state.get("workflow")
@@ -537,15 +541,13 @@ def task_workflow(state):
     if recorded is not None:
         raise ValueError(f"任务的工作流类型无效: {recorded!r}；请核实 state.json")
     task_dir = Path(state["task_dir"])
-    inferred = "PLAN_REQUIRED" if (
-        state.get("approved_plan") is not None
-        or any(run.get("phase") == "PLAN" for run in state.get("runs") or [])
-        or (task_dir / "plan.md").exists()
-    ) else "DIRECT_REVIEW"
-    state["workflow"] = inferred
+    state["workflow"] = "PLAN_REQUIRED"
     state["workflow_migrated_at"] = now()
+    state["workflow_migration_note"] = (
+        "旧任务没有 workflow 记录，按旧版要求方案文件的约定固定为 PLAN_REQUIRED；"
+        "如确为直接评审任务，请新建任务")
     save_json(task_dir / "state.json", state)
-    return inferred
+    return "PLAN_REQUIRED"
 
 
 def consult(args):
@@ -560,8 +562,15 @@ def consult(args):
     if is_link(project / "work") or is_link(project / "work" / "codex-review-consult"):
         raise ValueError("咨询目录不能经过符号链接或目录联接")
     previous = None
+    consult_base = project / "work" / "codex-review-consult"
     if args.session:
-        root = project / "work" / "codex-review-consult" / args.session
+        # 只接受程序生成的咨询 ID，并确保最终路径仍在咨询目录内。
+        session = str(args.session)
+        if not CONSULT_ID.fullmatch(session):
+            raise ValueError("session 必须是程序生成的咨询 ID（形如 C20261026T060000Z-ab12cd34）")
+        root = (consult_base / session).resolve()
+        if not root.is_relative_to(consult_base.resolve()) or root.parent != consult_base.resolve():
+            raise ValueError("session 路径越出咨询目录，已拒绝")
         previous = read_json(root / "consult.json")
         if Path(previous["project"]) != project:
             raise ValueError("该咨询记录不属于当前项目")
@@ -570,12 +579,26 @@ def consult(args):
     codex = shutil.which("codex.exe") if os.name == "nt" else shutil.which("codex")
     if not codex:
         raise ValueError("找不到 Codex 原生 CLI；请安装并登录，不会伪造咨询答复")
-    if previous is None:
-        consult_id = "C" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        root = project / "work" / "codex-review-consult" / consult_id
-    consult_id = root.name
-    root.mkdir(parents=True, exist_ok=True)
+    consult_base.mkdir(parents=True, exist_ok=True)
     warning = exclude_review_records(project, extra="codex-review-consult")
+    if previous is None:
+        # 秒级时间戳不足以唯一标识：同一秒内可能创建两条独立咨询。
+        # 加随机后缀并用 exist_ok=False，绝不复用已有的咨询目录。
+        while True:
+            consult_id = "C" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+            root = consult_base / consult_id
+            try:
+                root.mkdir(exist_ok=False)
+                break
+            except FileExistsError:
+                continue
+    consult_id = root.name
+    # 同一咨询的轮次编号与 consult.json 必须串行修改，否则并发续接会抢同一编号。
+    with task_lock(root):
+        return _consult_locked(args, project, root, consult_id, previous, question, codex, warning)
+
+
+def _consult_locked(args, project, root, consult_id, previous, question, codex, warning):
     turn = len([p for p in root.iterdir() if p.is_dir() and p.name[:3].isdigit()]) + 1
     turn_dir = root / f"{turn:03d}"
     turn_dir.mkdir(exist_ok=False)
@@ -607,6 +630,9 @@ def consult(args):
 
     def on_thread(tid):
         uuid.UUID(tid)
+        # 续接咨询时必须回到原会话；换会话会让历史上下文断裂且无法核对。
+        if record.get("thread_id") and record["thread_id"] != tid:
+            raise ValueError("续接返回了不同会话 ID，不能混用其他咨询的上下文")
         record["thread_id"] = tid
         save_json(root / "consult.json", record)
 
@@ -751,10 +777,16 @@ def review(args):
         codex = shutil.which("codex.exe") if os.name == "nt" else shutil.which("codex")
         if not codex:
             raise ValueError("找不到 Codex 原生 CLI；请安装并登录，不会伪造审查")
-        # 未启动过 Codex 的 PREPARING/准备失败记录占用同一编号，重试时就地复用它的目录
-        stale = next((run for run in state["runs"] if run.get("command") is None), None)
-        record = stale or {"number": len(state["runs"]) + 1, "phase": phase, "started_at": now(),
-                           "status": "PREPARING"}
+        # 只复用「最后一条、当前阶段、从未启动过 Codex」的准备记录。
+        # 早期实现只按 command is None 匹配，会把历史上其它阶段失败的记录抢来改写，
+        # 损失其原始阶段信息。
+        last = state["runs"][-1] if state["runs"] else None
+        stale = None
+        if (last is not None and last.get("command") is None
+                and last.get("phase") == phase and last.get("status") in {"PREPARING", "ERROR"}):
+            stale = last
+        record = stale or {"number": (last["number"] + 1) if last else 1, "phase": phase,
+                           "started_at": now(), "status": "PREPARING"}
         record.update(phase=phase, started_at=now(), status="PREPARING", input_hashes=hashes,
                       images=images, command=None, review_fingerprint=fingerprint,
                       artifact_fingerprint=json_digest(snapshot) if snapshot is not None else None)
@@ -898,25 +930,36 @@ def acceptance_validity(task, state):
 def status(args):
     task = Path(args.task).resolve(strict=True)
     verify = args.command == "verify"
-    holder = lock_holder(task)
-    if verify and holder is not None:
-        # 审查进行中，磁盘上的材料随时可能变化：不能对交付下任何结论
+    # status 只读、不取锁，审查运行期间也能查询进度。
+    if not verify:
+        holder = lock_holder(task)
+        task, state = load_task(task)
+        valid, reason = acceptance_validity(task, state)
+        emit({"task_id": state["task_id"], "thread_id": state["thread_id"],
+              "status": "RUNNING" if holder else "STATUS", "running": holder,
+              "last_run": state["runs"][-1] if state["runs"] else None,
+              "current_acceptance_valid": valid, "reason": reason, "exit_code": 0,
+              "note": "本地记录可写；校验不替代内容审查，也不是不可绕过的权限门禁"})
+        return 0
+    # verify 必须与 review 互斥：只在检查前探一次锁会留下 TOCTOU 窗口，
+    # 新一轮 accept 可能在校验过程中开始，使 verify 用旧 PASS 返回 0。
+    try:
+        with task_lock(task):
+            _, state = load_task(task)
+            valid, reason = acceptance_validity(task, state)
+            code = 0 if valid else 10
+            emit({"task_id": state["task_id"], "thread_id": state["thread_id"],
+                  "status": "PASS" if valid else "STALE", "running": None,
+                  "last_run": state["runs"][-1] if state["runs"] else None,
+                  "current_acceptance_valid": valid, "reason": reason, "exit_code": code,
+                  "note": "本地记录可写；校验不替代内容审查，也不是不可绕过的权限门禁"})
+            return code
+    except FileExistsError:
         emit({"task_id": None, "thread_id": None, "status": "BUSY",
               "reason": "审查正在进行，结束前不能核实验收；请稍后重试",
-              "running": holder, "current_acceptance_valid": False,
+              "running": lock_holder(task), "current_acceptance_valid": False,
               "exit_code": 10, "note": "status（不带 verify）可查看当前进度"})
         return 10
-    # status 只读：不获取写锁，因此审查运行期间也能查询进度
-    task, state = load_task(task)
-    valid, reason = acceptance_validity(task, state)
-    code = (0 if valid else 10) if verify else 0
-    emit({"task_id": state["task_id"], "thread_id": state["thread_id"],
-          "status": ("PASS" if valid else "STALE") if verify else ("RUNNING" if holder else "STATUS"),
-          "running": holder,
-          "last_run": state["runs"][-1] if state["runs"] else None,
-          "current_acceptance_valid": valid, "reason": reason, "exit_code": code,
-          "note": "本地记录可写；校验不替代内容审查，也不是不可绕过的权限门禁"})
-    return code
 
 
 def main():

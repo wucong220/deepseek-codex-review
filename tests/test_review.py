@@ -185,22 +185,35 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不允许 review"):
             self.call("review")
 
-    def test_legacy_state_without_workflow_is_migrated_from_history(self):
-        """旧任务按历史推断类型并固定下来。"""
-        # 有 PLAN 轮次的历史 -> PLAN_REQUIRED
-        self.call("plan")
+    def test_legacy_state_without_workflow_is_always_plan_required(self):
+        """旧任务没有 workflow 记录时一律判为 PLAN_REQUIRED，不做降级推断。
+
+        旧版 init 都要求方案文件，因此「没有类型记录」不能被解释成可以直接 review。
+        """
         state = r.read_json(self.task / "state.json")
         del state["workflow"]
+        state["runs"] = []
+        state["approved_plan"] = None
         r.save_json(self.task / "state.json", state)
         self.assertEqual(r.task_workflow(r.read_json(self.task / "state.json")), "PLAN_REQUIRED")
-        self.assertEqual(r.read_json(self.task / "state.json")["workflow"], "PLAN_REQUIRED")
-        # 无 PLAN 轮次的历史 -> DIRECT_REVIEW
-        self.review_task()
+        refreshed = r.read_json(self.task / "state.json")
+        self.assertEqual(refreshed["workflow"], "PLAN_REQUIRED")
+        self.assertIn("workflow_migration_note", refreshed)
+
+    def test_legacy_task_without_plan_md_cannot_be_reviewed(self):
+        """P1-01：旧任务即便 plan.md 丢失，也不能被迁移成 DIRECT_REVIEW 绕过方案门禁。"""
         state = r.read_json(self.task / "state.json")
         del state["workflow"]
+        state["runs"] = []
+        state["approved_plan"] = None
         r.save_json(self.task / "state.json", state)
-        self.assertEqual(r.task_workflow(r.read_json(self.task / "state.json")), "DIRECT_REVIEW")
-        self.assertEqual(r.read_json(self.task / "state.json")["workflow"], "DIRECT_REVIEW")
+        (self.task / "plan.md").unlink()
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "不允许 review"):
+            self.call("review")
+        self.assertEqual(r.read_json(self.task / "state.json")["workflow"], "PLAN_REQUIRED")
+        # 不能产生任何有效交付结论
+        self.assertFalse(r.acceptance_validity(self.task, r.read_json(self.task / "state.json"))[0])
 
     def test_invalid_workflow_value_is_rejected(self):
         state = r.read_json(self.task / "state.json")
@@ -222,6 +235,117 @@ class RunnerTests(unittest.TestCase):
         valid, reason = r.acceptance_validity(self.task, r.read_json(self.task / "state.json"))
         self.assertFalse(valid)
         self.assertIn("ACCEPTANCE/PASS", reason)
+
+    def test_consult_ids_are_unique_even_within_the_same_second(self):
+        """P1-02：同一秒创建的多条咨询不能共用目录、不能互相覆盖记录。"""
+        question = Path(self.tmp.name) / "q.md"
+        question.write_text("问题", encoding="utf-8")
+        def ok(command, prompt, run_dir, timeout, on_thread):
+            on_thread(THREAD)
+            return "答复"
+        ids = []
+        with patch.object(r, "invoke_consult", side_effect=ok), \
+             patch.object(r.shutil, "which", side_effect=lambda name: "codex-fixture" if name in {"codex", "codex.exe"} else WHICH(name)), \
+             redirect_stdout(io.StringIO()) as out:
+            for _ in range(3):
+                out.truncate(0); out.seek(0)
+                self.assertEqual(r.consult(argparse.Namespace(project=str(self.project), question_file=str(question),
+                                                              session=None, timeout=10)), 0)
+                ids.append(json.loads(out.getvalue().strip().splitlines()[-1])["consult_id"])
+        self.assertEqual(len(set(ids)), 3)
+        for cid in ids:
+            self.assertRegex(cid, r"^C\d{8}T\d{6}Z-[0-9a-f]{8}$")
+            record = r.read_json(self.project / "work/codex-review-consult" / cid / "consult.json")
+            self.assertEqual(record["consult_id"], cid)
+            self.assertEqual(len(record["turns"]), 1)
+
+    def test_consult_session_rejects_path_traversal(self):
+        """P2-01：--session 只接受程序生成的 ID，拒绝越界路径。"""
+        question = Path(self.tmp.name) / "q.md"
+        question.write_text("问题", encoding="utf-8")
+        for bad in ("../../etc", "..", "C:/Windows", "a/b", "C20261026T060000Z"):
+            with self.subTest(session=bad), self.assertRaisesRegex(ValueError, "session"):
+                r.consult(argparse.Namespace(project=str(self.project), question_file=str(question),
+                                             session=bad, timeout=10))
+
+    def test_consult_rejects_switching_to_a_different_session(self):
+        """P2-01：续接咨询时返回不同会话 ID 必须拒绝。"""
+        question = Path(self.tmp.name) / "q.md"
+        question.write_text("问题", encoding="utf-8")
+        def first(command, prompt, run_dir, timeout, on_thread):
+            on_thread(THREAD)
+            return "答复"
+        with patch.object(r, "invoke_consult", side_effect=first), \
+             patch.object(r.shutil, "which", side_effect=lambda name: "codex-fixture" if name in {"codex", "codex.exe"} else WHICH(name)), \
+             redirect_stdout(io.StringIO()):
+            r.consult(argparse.Namespace(project=str(self.project), question_file=str(question), session=None, timeout=10))
+        cid = next((self.project / "work/codex-review-consult").iterdir()).name
+        def other(command, prompt, run_dir, timeout, on_thread):
+            on_thread(OTHER)
+            return "答复"
+        with patch.object(r, "invoke_consult", side_effect=other), \
+             patch.object(r.shutil, "which", side_effect=lambda name: "codex-fixture" if name in {"codex", "codex.exe"} else WHICH(name)), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(r.consult(argparse.Namespace(project=str(self.project), question_file=str(question),
+                                                          session=cid, timeout=10)), 12)
+        record = r.read_json(self.project / "work/codex-review-consult" / cid / "consult.json")
+        self.assertEqual(record["thread_id"], THREAD)
+
+    def test_consult_records_are_excluded_from_artifact_snapshot(self):
+        """P2-03：咨询记录不属于正式产物，不能影响 PASS 的有效性。"""
+        self.review_task()
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        artifacts = r.read_json(self.task / "artifacts.json")
+        artifacts["paths"] = ["app.py", "work"]
+        r.save_json(self.task / "artifacts.json", artifacts)
+        (self.project / "work" / "kept.txt").write_text("真实产物", encoding="utf-8")
+        self.assertEqual(self.call("review"), 0)
+        self.assertTrue(self.valid())
+        # 新增一条咨询不应让已有结论变成 STALE
+        consult_dir = self.project / "work" / "codex-review-consult" / "C20261026T060000Z-deadbeef"
+        (consult_dir / "001").mkdir(parents=True)
+        r.save_json(consult_dir / "consult.json", {"consult_id": "C20261026T060000Z-deadbeef"})
+        (consult_dir / "001" / "response.md").write_text("答复", encoding="utf-8")
+        self.assertTrue(self.valid())
+
+    def test_verify_takes_the_lock_and_reports_busy(self):
+        """P1-03：verify 必须持锁校验，运行中一律 BUSY/10。"""
+        self.review_task()
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        self.assertEqual(self.call("review"), 0)
+        with r.task_lock(self.task):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = r.status(argparse.Namespace(task=str(self.task), command="verify"))
+        self.assertEqual(code, 10)
+        self.assertEqual(json.loads(out.getvalue().strip().splitlines()[-1])["status"], "BUSY")
+        # 锁释放后恢复可用
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(r.status(argparse.Namespace(task=str(self.task), command="verify")), 0)
+
+    def test_preparing_retry_reuses_only_last_same_phase_record(self):
+        """P2-02：只复用最后一条、同阶段、未启动 Codex 的记录。"""
+        # 先在 PLAN 阶段制造一次准备失败
+        original = r.shutil.copyfile
+        state = {"fail": True}
+        def flaky(src, dst, *a, **kw):
+            if state["fail"] and Path(dst).name == "request.md":
+                raise OSError("模拟失败")
+            return original(src, dst, *a, **kw)
+        with patch.object(r.shutil, "copyfile", side_effect=flaky):
+            self.assertEqual(self.call("plan"), 12)
+        runs = r.read_json(self.task / "state.json")["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["phase"], "PLAN")
+        self.assertEqual(runs[0]["status"], "ERROR")
+        # 换到另一阶段（这里直接构造一条已启动的 PLAN 记录）不应抢走它
+        state["fail"] = False
+        self.assertEqual(self.call("plan"), 0)
+        runs = r.read_json(self.task / "state.json")["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["status"], "PASS")
+        self.assertIsNotNone(runs[0]["command"])
 
     def test_consult_records_advice_without_approval(self):
         """咨询只留轻量记录，不产生 PASS/REVISE，也不算验收通过。"""

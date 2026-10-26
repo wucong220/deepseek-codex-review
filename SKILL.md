@@ -34,7 +34,7 @@ description: DeepSeek Harness 的 Codex 前置咨询与完工验收流程。接�
 
 **增删或修改任务目录里的 `plan.md` 都不会改变类型**，脚本会先判类型再判阶段。想在两种流程之间换，必须新建任务。这条由脚本强制，不只靠本文档约束。
 
-旧任务（`state.json` 里没有 `workflow`）按历史自动推断并固定：有过方案批准记录或出现过 `plan` 轮次的算 `PLAN_REQUIRED`，其余算 `DIRECT_REVIEW`，并记录 `workflow_migrated_at`。推断后不再变化。
+旧任务（`state.json` 里没有 `workflow`）**一律固定为 `PLAN_REQUIRED`**，不做降级推断。原因是旧版 `init` 都要求方案文件，所以「没有类型记录」不是「可以直接 review」的证据；若据此推断，一个方案被误删或恢复失败的旧任务就能绕过方案门禁。迁移时写入 `workflow_migrated_at` 和 `workflow_migration_note`。确实属于直接评审的旧任务请新建任务。
 
 同一任务的澄清、修改、复评保留同一个明确的会话 ID；不同任务分别建会话。
 
