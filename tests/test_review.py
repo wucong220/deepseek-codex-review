@@ -169,6 +169,22 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不允许 accept"):
             self.call("accept")
 
+    def test_legacy_task_with_plan_md_but_no_plan_run_is_plan_required(self):
+        """旧任务：有 plan.md 但还没跑过 plan，必须判为 PLAN_REQUIRED。
+
+        否则这类任务会被当成 DIRECT_REVIEW，重新打开绕过方案门禁的路径。
+        """
+        state = r.read_json(self.task / "state.json")
+        del state["workflow"]
+        state["runs"] = []
+        state["approved_plan"] = None
+        r.save_json(self.task / "state.json", state)
+        self.assertTrue((self.task / "plan.md").exists())
+        self.assertEqual(r.task_workflow(r.read_json(self.task / "state.json")), "PLAN_REQUIRED")
+        (self.task / "execution.md").write_text("证据", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "不允许 review"):
+            self.call("review")
+
     def test_legacy_state_without_workflow_is_migrated_from_history(self):
         """旧任务按历史推断类型并固定下来。"""
         # 有 PLAN 轮次的历史 -> PLAN_REQUIRED

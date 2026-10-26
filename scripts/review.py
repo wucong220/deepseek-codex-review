@@ -525,22 +525,26 @@ WORKFLOW_FINAL_PHASE = {"PLAN_REQUIRED": "ACCEPTANCE", "DIRECT_REVIEW": "REVIEW"
 def task_workflow(state):
     """返回任务的固定工作流类型。
 
-    旧任务（早于 workflow 字段）按历史推断：存在方案批准记录或出现过 PLAN 轮次即视为
-    PLAN_REQUIRED；否则视为 DIRECT_REVIEW。推断结果写回 state 以固定，之后不会再被
-    增删 plan.md 影响。
+    旧任务（早于 workflow 字段）按历史推断：只要出现过 PLAN 轮次、留有方案批准记录，
+    或任务目录里存在 plan.md，就视为 PLAN_REQUIRED；其余视为 DIRECT_REVIEW。
+    把 plan.md 也算作信号，是因为「带方案初始化但尚未 plan」的旧任务否则会被判成
+    DIRECT_REVIEW，从而重新打开绕过方案门禁的路径。
+    推断结果立即写回 state 固定，之后不再受 plan.md 增删影响。
     """
     recorded = state.get("workflow")
     if recorded in WORKFLOWS:
         return recorded
     if recorded is not None:
         raise ValueError(f"任务的工作流类型无效: {recorded!r}；请核实 state.json")
+    task_dir = Path(state["task_dir"])
     inferred = "PLAN_REQUIRED" if (
         state.get("approved_plan") is not None
         or any(run.get("phase") == "PLAN" for run in state.get("runs") or [])
+        or (task_dir / "plan.md").exists()
     ) else "DIRECT_REVIEW"
     state["workflow"] = inferred
     state["workflow_migrated_at"] = now()
-    save_json(Path(state["task_dir"]) / "state.json", state)
+    save_json(task_dir / "state.json", state)
     return inferred
 
 
