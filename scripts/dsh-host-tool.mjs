@@ -37,9 +37,9 @@ export async function apply(ctx, config = {}) {
   const {defineTool} = await import(pathToFileURL(join(config.dshRoot, 'node_modules/@deepseek-ai/dsh-tools/lib/index.js')).href);
   ctx.tools.register(defineTool({
     name: 'codex_review',
-    description: 'Run the user-authorized fixed Codex review helper for this workspace: plan, acceptance, status or delivery verification. Codex keeps its own read-only sandbox and default model/effort. No arbitrary shell commands. Initialize task materials using the deepseek-codex-review Skill first.',
+    description: 'Run the user-authorized fixed Codex review helper for this workspace: plan (review a proposed plan), accept (acceptance after an approved plan), review (directly review an existing project without PLAN/PASS), status or delivery verification. Codex keeps its own read-only sandbox and default model/effort. No arbitrary shell commands. Initialize task materials using the deepseek-codex-review Skill first.',
     parameters: {
-      action: {type:'string', required:true, enum:['plan','accept','status','verify']},
+      action: {type:'string', required:true, enum:['plan','accept','review','status','verify']},
       task_dir: {type:'string', required:true, description:'Absolute existing task directory under this session workspace/work/codex-review'},
       images: {type:'array', items:{type:'string'}, description:'Optional absolute image paths inside this workspace'},
     },
@@ -49,7 +49,7 @@ export async function apply(ctx, config = {}) {
     },
     async execute(args, exec) {
       exec.signal.throwIfAborted();
-      if (!['plan','accept','status','verify'].includes(args.action)) throw new Error('Unsupported action');
+      if (!['plan','accept','review','status','verify'].includes(args.action)) throw new Error('Unsupported action');
       const {workspace, task} = await validateTask(args.task_dir, exec.agent?.session.header.cwd);
       const script = await realpath(config.reviewScript);
       const hash = createHash('sha256').update(await readFile(script)).digest('hex');

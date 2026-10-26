@@ -2,7 +2,7 @@
   "type": "object",
   "properties": {
     "task_id": {"type": "string"},
-    "phase": {"type": "string", "enum": ["PLAN", "ACCEPTANCE"]},
+    "phase": {"type": "string", "enum": ["PLAN", "ACCEPTANCE", "REVIEW"]},
     "review_fingerprint": {"type": "string"},
     "verdict": {"type": "string", "enum": ["PASS", "REVISE", "BLOCKED"]},
     "summary": {"type": "string"},

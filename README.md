@@ -42,29 +42,50 @@ gh repo clone wucong220/deepseek-codex-review "$env:USERPROFILE\.dsh\skills\deep
 
 > 每项用户需求在实质开工前加载 deepseek-codex-review Skill，先通过 Codex 方案评审；执行后续接同一个审查会话验收，修复后复验，通过后再交付。保存完整需求、适用约束与真实产物证据。Codex 审查者不递归调用此流程。
 
-命令入口和材料要求见 [SKILL.md](SKILL.md)。基本调用：
+命令入口和材料要求见 [SKILL.md](SKILL.md)。三个入口：
+
+| 入口 | 用途 | 是否要求方案 |
+|---|---|---|
+| `consult` | 要建议，不交付成果 | 否，且**不构成验收** |
+| `plan` → `accept` | 先审方案，批准后实施，最后验收 | 是 |
+| `review` | 直接评审已有项目或产物 | **否** |
+
+基本调用：
 
 ```powershell
 $review = "$env:USERPROFILE\.dsh\skills\deepseek-codex-review\scripts\review.py"
+
+# 方案先行：从零开始做一件事
 python $review init --project '项目绝对路径' --request-file '需求文件绝对路径' --plan-file '方案文件绝对路径' --requirements-file '需求清单绝对路径' --artifacts-file '产物清单绝对路径'
 python $review plan --task '上一步返回的 task_dir'
 # 按通过的需求和方案执行，更新该任务的 execution.md 后：
 python $review accept --task '同一个 task_dir'
+
+# 直接评审已有项目：省略 --plan-file
+python $review init --project '项目绝对路径' --request-file '审核要求绝对路径' --requirements-file '需求清单绝对路径' --artifacts-file '产物清单绝对路径'
+python $review review --task '上一步返回的 task_dir'
+
+# 咨询：只要建议
+python $review consult --project '项目绝对路径' --question-file '问题绝对路径'
+python $review consult --project '项目绝对路径' --question-file '追问绝对路径' --session '上次返回的 consult_id'
+
 python $review verify --task '同一个 task_dir'
 python $review status --task '同一个 task_dir'
 ```
 
 需求清单格式为 `{"requirements":[{"id":"R1","text":"完整要求"}]}`；产物清单格式为 `{"paths":["src","outputs/report.xlsx"]}`。清单必须按实际任务编写，范围、来源及例子见 [SKILL.md](SKILL.md)。两份清单都参加方案批准校验，不能在验收时静默删减要求或产物。
 
-退出码：`0` 为相应阶段通过，`10` 为需要修改或版本已失效，`11` 为阻塞，`12` 为调用或记录错误。`PLAN/PASS` 只允许进入执行阶段；完工必须取得 `ACCEPTANCE/PASS`，并在交付前执行 `verify`。`status` 的退出码 0 只表示成功读取，不代表验收通过。
+`review` 免掉的是方案审批，不是审查标准：它同样逐条核对需求覆盖、绑定产物哈希、续接同一会话，并同样需要 `verify`。已有方案批准的任务不能改用 `review` 绕过门禁。
 
-记录保存在项目的 `work/codex-review/<task-id>/`，各轮材料、提示词、JSONL、stderr 与最终审查结果单独留存。
+退出码：`0` 为相应阶段通过，`10` 为需要修改或版本已失效（审查运行期间 `verify` 返回 `10` 和 `BUSY`），`11` 为阻塞，`12` 为调用或记录错误。`PLAN/PASS` 只允许进入执行阶段；完工必须取得 `ACCEPTANCE/PASS` 或 `REVIEW/PASS`，并在交付前执行 `verify`。`status` 的退出码 0 只表示成功读取，不代表验收通过。
+
+记录保存在项目的 `work/codex-review/<task-id>/`，各轮材料、提示词、JSONL、stderr 与最终审查结果单独留存。咨询记录单独存放在 `work/codex-review-consult/<consult_id>/`，只含问题、答复、会话 ID 与状态，不含需求清单、产物哈希或任何批准字段。
 
 ## Windows 与专用审查工具
 
 Codex 在只读审查项目时仍需要写自己的会话与运行状态。DSH 的外层命令沙箱可能阻止这些写入。应使用正式命令审批，或在用户明确授权后配置 `scripts/dsh-host-tool.mjs`。
 
-专用工具的 DSH 插件配置需要本机的 `dshRoot`、`pythonExe`、`reviewScript`、`scriptSha256` 和明确的 `authorizedHostReview: true`。它只接受 `plan`、`accept`、`status`、`verify`，校验任务归属当前工作区和固定脚本的 SHA-256；Codex 内层保持 `read-only`。每台机器单独配置自己的路径与授权。
+专用工具的 DSH 插件配置需要本机的 `dshRoot`、`pythonExe`、`reviewScript`、`scriptSha256` 和明确的 `authorizedHostReview: true`。它只接受 `plan`、`accept`、`review`、`status`、`verify`，校验任务归属当前工作区和固定脚本的 SHA-256；Codex 内层保持 `read-only`。每台机器单独配置自己的路径与授权。`scriptSha256` 必须在 `review.py` 改动后重新钉住，否则工具会拒绝运行（这是刻意的防篡改设计）。
 
 该工具启用后，DeepSeek 优先使用 `codex_review` 的 `action`、`task_dir` 参数；任务初始化和旧任务升级继续使用普通工作区命令。普通命令的权限设置保持原样。
 
